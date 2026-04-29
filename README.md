@@ -11,3 +11,5 @@ Be aware that I wrote this playbook for this environment:
 - OS: Ubuntu 24.04 (noble)
 - Existing Nexus Private registry
 - Existing DEB files of ELK Stack on HOSTED REPOSITORY
+
+Cause of the war at my country (IRAN vs USA and Israeil) for more than 40 DAYS, We didnt have access to internet. So I remove default linux repository from my  Ubuntu server, so that I havnt no errors for forign repositories.
