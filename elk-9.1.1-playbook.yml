@@ -4,6 +4,7 @@
 #       Release note:                                   #
 #           - V1 Just Install                           #
 #           - V1.10 Refactor + CA/Cert generation       #
+#           - V1.20 SSL Activated                       #
 #       Douran Co. LTD                                  #
 #########################################################
 
@@ -16,21 +17,24 @@
   vars:
     elk_version: "9.1.1"
 
-    nexus: "http://192.168.100.194/repository"
+    nexus: "<NEXUS URL>/repository"
     apt_proxy: "/apt-proxy-noble/"
     apt_hosted: "/apt-hosted/"
     nexus_components: "main restricted universe multiverse"
 
-    elk_node_name: "192.168.4.124"
-    elk_server_ip: "192.168.4.124"
+    elk_node_name: "<NODE NAME>"
+    elk_server_ip: "<NODE IP>"
 
     elasticsearch_network_host: "0.0.0.0"
     elasticsearch_http_port: 9200
     elasticsearch_data_path: "/var/lib/elasticsearch"
     elasticsearch_logs_path: "/var/log/elasticsearch"
+    elasticsearch_transport_port: 9300
 
     kibana_server_host: "0.0.0.0"
     kibana_server_port: 5601
+    kibana_public_url: "https://{{ elk_server_ip }}:{{ kibana_server_port }}"
+    server_ssl_keypassphrase: "{{ vault_kibana_key_pass }}"
 
     elastic_password: "{{ vault_elastic_password }}"
     kibana_system_password: "{{ vault_kibana_system_password }}"
@@ -46,6 +50,7 @@
     ca_p12_file: "{{ cert_ca_dir }}/elastic-stack-ca.p12"
     ca_crt_file: "{{ cert_ca_dir }}/elastic-stack-ca.crt"
     es_p12_file: "{{ cert_es_dir }}/elasticsearch.p12"
+    es_p12_passphrase: "{{ vault_es_p12_pass }}"
 
   tasks:
     - name: Download Nexus APT public key from Nexus RAW repo
@@ -153,7 +158,7 @@
         cmd: >
           /usr/share/elasticsearch/bin/elasticsearch-certutil cert
           --silent
-          --pass ""
+          --pass "{{ es_p12_passphrase }}"
           --ca {{ ca_p12_file }}
           --ca-pass ""
           --name {{ elk_node_name }}
@@ -192,7 +197,7 @@
           /usr/share/elasticsearch/bin/elasticsearch-certutil cert
           --silent
           --pem
-          --pass "123"
+          --pass "{{ server_ssl_keypassphrase }}"
           --ca {{ ca_p12_file }}
           --ca-pass ""
           --in {{ cert_tmp_dir }}/instances.yml
@@ -255,12 +260,20 @@
 
           network.host: {{ elasticsearch_network_host }}
           http.port: {{ elasticsearch_http_port }}
+          transport.port: {{ elasticsearch_transport_port }}
 
           discovery.type: single-node
 
           xpack.security.enabled: true
-          xpack.security.http.ssl.enabled: false
-          xpack.security.transport.ssl.enabled: false
+
+          xpack.security.http.ssl.enabled: true
+          xpack.security.http.ssl.keystore.path: certs/elasticsearch.p12
+          xpack.security.http.ssl.truststore.path: certs/elasticsearch.p12
+
+          xpack.security.transport.ssl.enabled: true
+          xpack.security.transport.ssl.verification_mode: certificate
+          xpack.security.transport.ssl.keystore.path: certs/elasticsearch.p12
+          xpack.security.transport.ssl.truststore.path: certs/elasticsearch.p12
       notify: restart elasticsearch
 
     - name: Configure kibana.yml
@@ -273,13 +286,18 @@
           server.host: {{ kibana_server_host }}
           server.port: {{ kibana_server_port }}
           server.name: elk-kibana
+          server.publicBaseUrl: "{{ kibana_public_url }}"
 
-          elasticsearch.hosts: ["http://localhost:{{ elasticsearch_http_port }}"]
+          server.ssl.enabled: true
+          server.ssl.certificate: {{ cert_kibana_dir }}/kibana.crt
+          server.ssl.key: {{ cert_kibana_dir }}/kibana.key
+          server.ssl.keyPassphrase: "{{ server_ssl_keypassphrase }}"
+
+          elasticsearch.hosts: ["https://localhost:{{ elasticsearch_http_port }}"]
           elasticsearch.username: "kibana_system"
           elasticsearch.password: "{{ kibana_system_password }}"
-
-          elasticsearch.ssl.verificationMode: none
-          server.ssl.enabled: false
+          elasticsearch.ssl.certificateAuthorities: ["{{ cert_kibana_dir }}/ca.crt"]
+          elasticsearch.ssl.verificationMode: certificate
       notify: restart kibana
 
     - name: Configure logstash.yml
@@ -294,14 +312,78 @@
           path.logs: /var/log/logstash
 
           xpack.monitoring.enabled: true
-          xpack.monitoring.elasticsearch.hosts: ["http://localhost:{{ elasticsearch_http_port }}"]
+          xpack.monitoring.elasticsearch.hosts: ["https://localhost:{{ elasticsearch_http_port }}"]
           xpack.monitoring.elasticsearch.username: "logstash_system"
           xpack.monitoring.elasticsearch.password: "{{ logstash_system_password }}"
+          xpack.monitoring.elasticsearch.ssl.certificate_authority: "{{ cert_logstash_dir }}/ca.crt"
+          xpack.monitoring.elasticsearch.ssl.verification_mode: certificate
 
           api.enabled: true
           api.http.host: 0.0.0.0
           api.http.port: 9600
       notify: restart logstash
+
+    - name: Ensure Elasticsearch keystore exists
+      ansible.builtin.command:
+        cmd: /usr/share/elasticsearch/bin/elasticsearch-keystore create
+      args:
+        creates: /etc/elasticsearch/elasticsearch.keystore
+
+    - name: Add HTTP SSL keystore password to Elasticsearch keystore
+      ansible.builtin.shell: |
+        echo "{{ es_p12_passphrase }}" | /usr/share/elasticsearch/bin/elasticsearch-keystore add -x -f xpack.security.http.ssl.keystore.secure_password
+      args:
+        creates: /etc/elasticsearch/.http_ssl_keystore_password_set
+
+    - name: Create HTTP SSL keystore password flag
+      ansible.builtin.file:
+        path: /etc/elasticsearch/.http_ssl_keystore_password_set
+        state: touch
+        owner: root
+        group: elasticsearch
+        mode: "0660"
+
+    - name: Add HTTP SSL truststore password to Elasticsearch keystore
+      ansible.builtin.shell: |
+        echo "{{ es_p12_passphrase }}" | /usr/share/elasticsearch/bin/elasticsearch-keystore add -x -f xpack.security.http.ssl.truststore.secure_password
+      args:
+        creates: /etc/elasticsearch/.http_ssl_truststore_password_set
+
+    - name: Create HTTP SSL truststore password flag
+      ansible.builtin.file:
+        path: /etc/elasticsearch/.http_ssl_truststore_password_set
+        state: touch
+        owner: root
+        group: elasticsearch
+        mode: "0660"
+
+    - name: Add transport SSL keystore password to Elasticsearch keystore
+      ansible.builtin.shell: |
+        echo "{{ es_p12_passphrase }}" | /usr/share/elasticsearch/bin/elasticsearch-keystore add -x -f xpack.security.transport.ssl.keystore.secure_password
+      args:
+        creates: /etc/elasticsearch/.transport_ssl_keystore_password_set
+
+    - name: Create transport SSL keystore password flag
+      ansible.builtin.file:
+        path: /etc/elasticsearch/.transport_ssl_keystore_password_set
+        state: touch
+        owner: root
+        group: elasticsearch
+        mode: "0660"
+
+    - name: Add transport SSL truststore password to Elasticsearch keystore
+      ansible.builtin.shell: |
+        echo "{{ es_p12_passphrase }}" | /usr/share/elasticsearch/bin/elasticsearch-keystore add -x -f xpack.security.transport.ssl.truststore.secure_password
+      args:
+        creates: /etc/elasticsearch/.transport_ssl_truststore_password_set
+
+    - name: Create transport SSL truststore password flag
+      ansible.builtin.file:
+        path: /etc/elasticsearch/.transport_ssl_truststore_password_set
+        state: touch
+        owner: root
+        group: elasticsearch
+        mode: "0660"
 
     - name: Start and enable Elasticsearch
       ansible.builtin.systemd:
@@ -389,12 +471,13 @@
 
     - name: Verify Elasticsearch authentication
       ansible.builtin.uri:
-        url: "http://localhost:{{ elasticsearch_http_port }}"
+        url: "https://localhost:{{ elasticsearch_http_port }}"
         method: GET
         user: elastic
         password: "{{ elastic_password }}"
         force_basic_auth: true
         status_code: 200
+        ca_path: "{{ ca_crt_file }}"
       register: es_auth_check
       until: es_auth_check.status == 200
       retries: 30
@@ -414,9 +497,10 @@
 
     - name: Wait for Kibana
       ansible.builtin.uri:
-        url: "http://{{ elk_server_ip }}:{{ kibana_server_port }}/api/status"
+        url: "https://{{ elk_server_ip }}:{{ kibana_server_port }}/api/status"
         method: GET
         status_code: 200
+        ca_path: "{{ ca_crt_file }}"
       register: kibana_status
       until: kibana_status.status == 200
       retries: 30
@@ -428,11 +512,11 @@
           ELK Stack {{ elk_version }} installation completed.
 
           Elasticsearch:
-            URL: http://{{ elk_server_ip }}:{{ elasticsearch_http_port }}
+            URL: https://{{ elk_server_ip }}:{{ elasticsearch_http_port }}
             User: elastic
 
           Kibana:
-            URL: http://{{ elk_server_ip }}:{{ kibana_server_port }}
+            URL: https://{{ elk_server_ip }}:{{ kibana_server_port }}
 
           Generated certificate files:
             CA: {{ ca_crt_file }}
