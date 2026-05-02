@@ -2,31 +2,50 @@
 #       ELK 9.1.1 installation playbook                 #
 #       Maintainer: Majid Mortazavi                     #
 #       Release note:                                   #
-#           - V.1.00  Just install                      #
+#           - V1 Just Install                           #
+#           - V1.10 Refactor + CA/Cert generation       #
 #       Douran Co. LTD                                  #
 #########################################################
 
 ---
-- name: Install ELK Stack 9.1.1 on Single Server (No Cluster, No SSL, Nexus Repo)
+- name: Install ELK Stack 9.1.1 on Single Server with Generated Certificates
   hosts: ELKServers
   remote_user: root
+  become: true
 
   vars:
     elk_version: "9.1.1"
-    nexus: "<YOUR NEXUS REPO>"
+
+    nexus: "http://192.168.100.194/repository"
     apt_proxy: "/apt-proxy-noble/"
     apt_hosted: "/apt-hosted/"
     nexus_components: "main restricted universe multiverse"
+
+    elk_node_name: "192.168.4.124"
+    elk_server_ip: "192.168.4.124"
+
     elasticsearch_network_host: "0.0.0.0"
     elasticsearch_http_port: 9200
-    kibana_server_host: "0.0.0.0"
-    kibana_server_port: 5601
-    elastic_password: "<ELASTIC PASSWORD>"
     elasticsearch_data_path: "/var/lib/elasticsearch"
     elasticsearch_logs_path: "/var/log/elasticsearch"
-    hostname: "<YOUR SERVER IP>"
-    kibana_system_password: "<KIBANA_SYSTEM PASSWORD>"
-    logstash_system_password: "<LOGSTASH_SYSTEM PASSWORD>"
+
+    kibana_server_host: "0.0.0.0"
+    kibana_server_port: 5601
+
+    elastic_password: "{{ vault_elastic_password }}"
+    kibana_system_password: "{{ vault_kibana_system_password }}"
+    logstash_system_password: "{{ vault_logstash_system_password }}"
+
+    cert_base_dir: "/etc/elastic-stack/certs"
+    cert_ca_dir: "/etc/elastic-stack/certs/ca"
+    cert_es_dir: "/etc/elasticsearch/certs"
+    cert_kibana_dir: "/etc/kibana/certs"
+    cert_logstash_dir: "/etc/logstash/certs"
+    cert_tmp_dir: "/tmp/elk-certs"
+
+    ca_p12_file: "{{ cert_ca_dir }}/elastic-stack-ca.p12"
+    ca_crt_file: "{{ cert_ca_dir }}/elastic-stack-ca.crt"
+    es_p12_file: "{{ cert_es_dir }}/elasticsearch.p12"
 
   tasks:
     - name: Download Nexus APT public key from Nexus RAW repo
@@ -35,19 +54,13 @@
         dest: "/usr/share/keyrings/nexus-apt.asc"
         mode: "0644"
 
-    - name: Ensure gnupg is installed
-      ansible.builtin.apt:
-        name: gnupg
-        state: present
-
     - name: Dearmor Nexus APT key
       ansible.builtin.command:
         cmd: "gpg --dearmor -o /usr/share/keyrings/nexus-apt.gpg /usr/share/keyrings/nexus-apt.asc"
-          # args:
+      args:
         creates: "/usr/share/keyrings/nexus-apt.gpg"
-        removes: "/usr/share/keyrings/nexus-apt.asc"
 
-    - name: Delete default sources in sources.list.d directory
+    - name: Remove default Ubuntu source files
       ansible.builtin.file:
         path: "{{ item }}"
         state: absent
@@ -55,12 +68,11 @@
         - /etc/apt/sources.list.d/ubuntu.sources
         - /etc/apt/sources.list.d/ubuntu.sources.curtin.orig
 
-    - name: Create Nexus repository configuration for Ubuntu 24.04 (Noble)
+    - name: Create Nexus repository configuration for Ubuntu 24.04
       ansible.builtin.copy:
         dest: /etc/apt/sources.list.d/nexus.list
         mode: "0644"
         content: |
-          # Nexus Repository Configuration
           deb [trusted=yes] {{ nexus }}{{ apt_proxy }} noble {{ nexus_components }}
           deb [trusted=yes] {{ nexus }}{{ apt_proxy }} noble-updates {{ nexus_components }}
           deb [trusted=yes] {{ nexus }}{{ apt_proxy }} noble-security {{ nexus_components }}
@@ -69,140 +81,260 @@
 
     - name: Update apt cache
       ansible.builtin.apt:
-        update_cache: yes
+        update_cache: true
 
-    - name: Set date and time
-      community.general.timezone:
-        name: Asia/Tehran
-
-    - name: Install prerequisites and ELK packages
+    - name: Install base packages
       ansible.builtin.apt:
         pkg:
-          - vim
-          - zip
+          - gnupg
           - curl
           - wget
           - unzip
-          - openjdk-17-jre
+          - zip
+          - vim
+          - openssl
+          - python3-pexpect
           - apt-transport-https
-          - kibana={{ elk_version }}
-          - elasticsearch={{ elk_version }}
-          - logstash=1:{{ elk_version }}-1
         state: present
-        update_cache: no
+        update_cache: true
 
-    - name: Configure elasticsearch.yml (append config)
-      ansible.builtin.blockinfile:
-        path: /etc/elasticsearch/elasticsearch.yml
-        create: yes
+    - name: Set timezone
+      community.general.timezone:
+        name: Asia/Tehran
+
+    - name: Install ELK packages
+      ansible.builtin.apt:
+        pkg:
+          - "elasticsearch={{ elk_version }}"
+          - "kibana={{ elk_version }}"
+          - "logstash=1:{{ elk_version }}-1"
+        state: present
+        update_cache: false
+
+    - name: Create certificate directories
+      ansible.builtin.file:
+        path: "{{ item.path }}"
+        state: directory
+        owner: "{{ item.owner }}"
+        group: "{{ item.group }}"
+        mode: "{{ item.mode }}"
+      loop:
+        - { path: "{{ cert_base_dir }}", owner: "root", group: "root", mode: "0750" }
+        - { path: "{{ cert_ca_dir }}", owner: "root", group: "root", mode: "0750" }
+        - { path: "{{ cert_es_dir }}", owner: "root", group: "elasticsearch", mode: "0750" }
+        - { path: "{{ cert_kibana_dir }}", owner: "root", group: "kibana", mode: "0750" }
+        - { path: "{{ cert_logstash_dir }}", owner: "root", group: "logstash", mode: "0750" }
+        - { path: "{{ cert_tmp_dir }}", owner: "root", group: "root", mode: "0750" }
+
+    - name: Generate Elastic Stack CA
+      ansible.builtin.command:
+        cmd: >
+          /usr/share/elasticsearch/bin/elasticsearch-certutil ca
+          --silent
+          --pass ""
+          --out {{ ca_p12_file }}
+      args:
+        creates: "{{ ca_p12_file }}"
+
+    - name: Export CA certificate to PEM
+      ansible.builtin.command:
+        cmd: >
+          openssl pkcs12
+          -in {{ ca_p12_file }}
+          -clcerts
+          -nokeys
+          -out {{ ca_crt_file }}
+          -passin pass:
+      args:
+        creates: "{{ ca_crt_file }}"
+
+    - name: Generate Elasticsearch PKCS12 certificate
+      ansible.builtin.command:
+        cmd: >
+          /usr/share/elasticsearch/bin/elasticsearch-certutil cert
+          --silent
+          --pass ""
+          --ca {{ ca_p12_file }}
+          --ca-pass ""
+          --name {{ elk_node_name }}
+          --dns localhost
+          --dns {{ elk_node_name }}
+          --ip 127.0.0.1
+          --ip {{ elk_server_ip }}
+          --out {{ es_p12_file }}
+      args:
+        creates: "{{ es_p12_file }}"
+
+    - name: Create instances file for PEM certificates
+      ansible.builtin.copy:
+        dest: "{{ cert_tmp_dir }}/instances.yml"
+        mode: "0600"
+        content: |
+          instances:
+            - name: kibana
+              dns:
+                - localhost
+                - {{ elk_node_name }}
+              ip:
+                - 127.0.0.1
+                - {{ elk_server_ip }}
+            - name: logstash
+              dns:
+                - localhost
+                - {{ elk_node_name }}
+              ip:
+                - 127.0.0.1
+                - {{ elk_server_ip }}
+
+    - name: Generate PEM certificates for Kibana and Logstash
+      ansible.builtin.command:
+        cmd: >
+          /usr/share/elasticsearch/bin/elasticsearch-certutil cert
+          --silent
+          --pem
+          --pass "123"
+          --ca {{ ca_p12_file }}
+          --ca-pass ""
+          --in {{ cert_tmp_dir }}/instances.yml
+          --out {{ cert_tmp_dir }}/elastic-stack-pem-certs.zip
+      args:
+        creates: "{{ cert_tmp_dir }}/elastic-stack-pem-certs.zip"
+
+    - name: Extract PEM certificates
+      ansible.builtin.unarchive:
+        src: "{{ cert_tmp_dir }}/elastic-stack-pem-certs.zip"
+        dest: "{{ cert_tmp_dir }}"
+        remote_src: true
+        creates: "{{ cert_tmp_dir }}/kibana/kibana.crt"
+
+    - name: Copy Kibana certificates
+      ansible.builtin.copy:
+        src: "{{ item.src }}"
+        dest: "{{ cert_kibana_dir }}/{{ item.dest }}"
+        remote_src: true
+        owner: root
+        group: kibana
+        mode: "{{ item.mode }}"
+      loop:
+        - { src: "{{ cert_tmp_dir }}/kibana/kibana.crt", dest: "kibana.crt", mode: "0640" }
+        - { src: "{{ cert_tmp_dir }}/kibana/kibana.key", dest: "kibana.key", mode: "0640" }
+        - { src: "{{ ca_crt_file }}", dest: "ca.crt", mode: "0644" }
+
+    - name: Copy Logstash certificates
+      ansible.builtin.copy:
+        src: "{{ item.src }}"
+        dest: "{{ cert_logstash_dir }}/{{ item.dest }}"
+        remote_src: true
+        owner: root
+        group: logstash
+        mode: "{{ item.mode }}"
+      loop:
+        - { src: "{{ cert_tmp_dir }}/logstash/logstash.crt", dest: "logstash.crt", mode: "0640" }
+        - { src: "{{ cert_tmp_dir }}/logstash/logstash.key", dest: "logstash.key", mode: "0640" }
+        - { src: "{{ ca_crt_file }}", dest: "ca.crt", mode: "0644" }
+
+    - name: Set Elasticsearch certificate permissions
+      ansible.builtin.file:
+        path: "{{ es_p12_file }}"
+        owner: root
+        group: elasticsearch
+        mode: "0640"
+
+    - name: Configure elasticsearch.yml
+      ansible.builtin.copy:
+        dest: /etc/elasticsearch/elasticsearch.yml
         owner: root
         group: elasticsearch
         mode: "0660"
-        block: |
-          # ======================== Elasticsearch Configuration =========================
-          # Override default settings for single node mode
-
-          # Cluster name
+        content: |
           cluster.name: elk-single-node
+          node.name: {{ elk_node_name }}
 
-          # Node name
-          node.name: {{ hostname }}
+          path.data: {{ elasticsearch_data_path }}
+          path.logs: {{ elasticsearch_logs_path }}
 
-          # Network
           network.host: {{ elasticsearch_network_host }}
           http.port: {{ elasticsearch_http_port }}
 
-          # Single node discovery (this overrides cluster.initial_master_nodes)
           discovery.type: single-node
 
-          # Disable bootstrap checks for single node
-          discovery.seed_providers: file
-
-          # Security settings
+          xpack.security.enabled: true
           xpack.security.http.ssl.enabled: false
           xpack.security.transport.ssl.enabled: false
-        marker: "# {mark} ANSIBLE MANAGED BLOCK"
-
-    - name: Remove conflicting settings from elasticsearch.yml
-      ansible.builtin.replace:
-        path: /etc/elasticsearch/elasticsearch.yml
-        regexp: '^cluster\.initial_master_nodes:.*$'
-        replace: '# cluster.initial_master_nodes: disabled for single-node'
       notify: restart elasticsearch
 
-    - name: Configure kibana.yml (append config)
-      ansible.builtin.blockinfile:
-        path: /etc/kibana/kibana.yml
-        create: yes
+    - name: Configure kibana.yml
+      ansible.builtin.copy:
+        dest: /etc/kibana/kibana.yml
         owner: root
         group: kibana
         mode: "0660"
-        block: |
-          # ======================== Kibana Configuration =========================
+        content: |
           server.host: {{ kibana_server_host }}
           server.port: {{ kibana_server_port }}
-          server.name: "elk-kibana"
+          server.name: elk-kibana
 
-          # Elasticsearch connection
           elasticsearch.hosts: ["http://localhost:{{ elasticsearch_http_port }}"]
           elasticsearch.username: "kibana_system"
           elasticsearch.password: "{{ kibana_system_password }}"
 
-          # Security
           elasticsearch.ssl.verificationMode: none
           server.ssl.enabled: false
-        marker: "# {mark} ANSIBLE MANAGED BLOCK"
+      notify: restart kibana
 
-    - name: Configure logstash.yml (append config)
-      ansible.builtin.blockinfile:
-        path: /etc/logstash/logstash.yml
-        create: yes
+    - name: Configure logstash.yml
+      ansible.builtin.copy:
+        dest: /etc/logstash/logstash.yml
         owner: root
         group: logstash
         mode: "0660"
-        block: |
-          # ======================== Logstash Configuration =========================
-          node.name: {{ hostname }}
+        content: |
+          node.name: {{ elk_node_name }}
           path.data: /var/lib/logstash
           path.logs: /var/log/logstash
 
-          # Elasticsearch connection
           xpack.monitoring.enabled: true
           xpack.monitoring.elasticsearch.hosts: ["http://localhost:{{ elasticsearch_http_port }}"]
           xpack.monitoring.elasticsearch.username: "logstash_system"
           xpack.monitoring.elasticsearch.password: "{{ logstash_system_password }}"
 
-          # API settings
           api.enabled: true
           api.http.host: 0.0.0.0
           api.http.port: 9600
-        marker: "# {mark} ANSIBLE MANAGED BLOCK"
+      notify: restart logstash
 
-    - name: Start and enable Elasticsearch service
+    - name: Start and enable Elasticsearch
       ansible.builtin.systemd:
         name: elasticsearch
         state: started
-        enabled: yes
+        enabled: true
 
-    - name: Wait for Elasticsearch to start (check port)
+    - name: Wait for Elasticsearch port
       ansible.builtin.wait_for:
+        host: localhost
         port: "{{ elasticsearch_http_port }}"
-        host: "localhost"
         delay: 10
-        timeout: 60
+        timeout: 120
         state: started
 
-    - name: Set bootstrap password for elastic user
+    - name: Set password for elastic user
       ansible.builtin.expect:
         command: /usr/share/elasticsearch/bin/elasticsearch-reset-password -u elastic -i
         responses:
           "Please confirm that you would like to continue": "y"
           "Enter password for \\[elastic\\]": "{{ elastic_password }}"
           "Re-enter password for \\[elastic\\]": "{{ elastic_password }}"
-        creates: "/etc/elasticsearch/.bootstrapped"
-      environment:
-        JAVA_HOME: /usr/lib/jvm/java-17-openjdk-amd64
-      register: password_result
+        creates: "/etc/elasticsearch/.elastic_password_set"
+      register: elastic_password_result
+
+    - name: Create elastic password flag
+      ansible.builtin.file:
+        path: /etc/elasticsearch/.elastic_password_set
+        state: touch
+        owner: root
+        group: elasticsearch
+        mode: "0660"
+      when: elastic_password_result is changed
 
     - name: Set password for kibana_system user
       ansible.builtin.expect:
@@ -212,9 +344,16 @@
           "Enter password for \\[kibana_system\\]": "{{ kibana_system_password }}"
           "Re-enter password for \\[kibana_system\\]": "{{ kibana_system_password }}"
         creates: "/etc/elasticsearch/.kibana_system_password_set"
-      environment:
-        JAVA_HOME: /usr/lib/jvm/java-17-openjdk-amd64
       register: kibana_password_result
+
+    - name: Create kibana_system password flag
+      ansible.builtin.file:
+        path: /etc/elasticsearch/.kibana_system_password_set
+        state: touch
+        owner: root
+        group: elasticsearch
+        mode: "0660"
+      when: kibana_password_result is changed
 
     - name: Set password for logstash_system user
       ansible.builtin.expect:
@@ -224,101 +363,97 @@
           "Enter password for \\[logstash_system\\]": "{{ logstash_system_password }}"
           "Re-enter password for \\[logstash_system\\]": "{{ logstash_system_password }}"
         creates: "/etc/elasticsearch/.logstash_system_password_set"
-      environment:
-        JAVA_HOME: /usr/lib/jvm/java-17-openjdk-amd64
       register: logstash_password_result
 
-    - name: Create flag file to prevent re-running password reset
+    - name: Create logstash_system password flag
       ansible.builtin.file:
-        path: /etc/elasticsearch/.bootstrapped
+        path: /etc/elasticsearch/.logstash_system_password_set
         state: touch
         owner: root
         group: elasticsearch
         mode: "0660"
+      when: logstash_password_result is changed
 
-    - name: Restart Elasticsearch after password change
+    - name: Restart Elasticsearch after password initialization
       ansible.builtin.systemd:
         name: elasticsearch
         state: restarted
 
     - name: Wait for Elasticsearch after restart
       ansible.builtin.wait_for:
+        host: localhost
         port: "{{ elasticsearch_http_port }}"
-        host: "localhost"
         delay: 15
         timeout: 120
+        state: started
 
-    - name: Verify Elasticsearch is accessible with new password
+    - name: Verify Elasticsearch authentication
       ansible.builtin.uri:
         url: "http://localhost:{{ elasticsearch_http_port }}"
         method: GET
         user: elastic
         password: "{{ elastic_password }}"
-        force_basic_auth: yes
+        force_basic_auth: true
         status_code: 200
-        validate_certs: no
       register: es_auth_check
       until: es_auth_check.status == 200
       retries: 30
       delay: 5
 
-    - name: Display Elasticsearch version info
-      ansible.builtin.debug:
-        msg: "Elasticsearch version: {{ es_auth_check.json.version.number }}"
-      when: es_auth_check.json is defined
-
-    - name: Start and enable Kibana service
+    - name: Start and enable Kibana
       ansible.builtin.systemd:
         name: kibana
         state: started
-        enabled: yes
+        enabled: true
 
-    - name: Start and enable Logstash service
+    - name: Start and enable Logstash
       ansible.builtin.systemd:
         name: logstash
         state: started
-        enabled: yes
+        enabled: true
 
-    - name: Wait for Kibana to be available
+    - name: Wait for Kibana
       ansible.builtin.uri:
-        url: "http://{{ hostname }}:{{ kibana_server_port }}/api/status"
+        url: "http://{{ elk_server_ip }}:{{ kibana_server_port }}/api/status"
+        method: GET
         status_code: 200
-      register: result
-      until: result.status == 200
+      register: kibana_status
+      until: kibana_status.status == 200
       retries: 30
       delay: 5
 
-    - name: Display success message
+    - name: Display installation summary
       ansible.builtin.debug:
         msg: |
-          ===============================================
-          ✅ ELK Stack 9.1.1 Installation Completed!
-          ===============================================
+          ELK Stack {{ elk_version }} installation completed.
 
-          Elasticsearch: http://{{ ansible_default_ipv4.address }}:{{ elasticsearch_http_port }}
-          Kibana:        http://{{ ansible_default_ipv4.address }}:{{ kibana_server_port }}
+          Elasticsearch:
+            URL: http://{{ elk_server_ip }}:{{ elasticsearch_http_port }}
+            User: elastic
 
-          Username: elastic
-          Password: {{ elastic_password }}
+          Kibana:
+            URL: http://{{ elk_server_ip }}:{{ kibana_server_port }}
 
-          ⚠️  For production, please change the elastic password!
-          ===============================================
+          Generated certificate files:
+            CA: {{ ca_crt_file }}
+            Elasticsearch PKCS12: {{ es_p12_file }}
+            Kibana cert dir: {{ cert_kibana_dir }}
+            Logstash cert dir: {{ cert_logstash_dir }}
+
+          SSL is generated but not enabled yet.
 
   handlers:
     - name: restart elasticsearch
       ansible.builtin.systemd:
         name: elasticsearch
         state: restarted
-      listen: "restart elasticsearch"
 
     - name: restart kibana
       ansible.builtin.systemd:
         name: kibana
         state: restarted
-      listen: "restart kibana"
 
     - name: restart logstash
       ansible.builtin.systemd:
         name: logstash
         state: restarted
-      listen: "restart logstash"
